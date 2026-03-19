@@ -94,66 +94,102 @@ def is_greeting_message(text: str) -> bool:
     return False
 
 
+
 def detect_fast_intent(text: str) -> str:
     lowered = normalize_text(text).lower()
+    compact = lowered.replace(" ", "")
 
     if is_greeting_message(lowered):
         return "greeting"
 
+    # TrueMoney signup
     true_signup_patterns = [
-        "true နဲ့ဖွင့်", "true နဲ့အကောင့်ဖွင့်",
-        "truemoney နဲ့ဖွင့်", "truemoney နဲ့အကောင့်ဖွင့်",
-        "true money နဲ့ဖွင့်", "true money နဲ့အကောင့်ဖွင့်",
+        "trueနဲ့ဖွင့်",
+        "trueနဲ့အကောင့်ဖွင့်",
+        "truemoneyနဲ့ဖွင့်",
+        "truemoneyနဲ့အကောင့်ဖွင့်",
+        "truemoneyနဲ့accountဖွင့်",
+        "truemoneyနဲ့signup",
+        "truemoneyနဲ့register",
+        "truemoneyဖွင့်",
+        "truemoneyနဲ့ဖွင့်",
+        "truemoney",
+        "truemoney",
     ]
-    if any(p in lowered for p in true_signup_patterns):
-        return "true_signup"
+    if any(p in compact for p in true_signup_patterns):
+        if "ဖွင့်" in compact or "signup" in compact or "register" in compact or "account" in compact:
+            return "true_signup"
 
+    # Normal signup
     signup_patterns = [
-        "အကောင့်ဖွင့်", "account ဖွင့်", "register", "signup"
+        "အကောင့်ဖွင့်",
+        "အကောင့်ဖွင့်",
+        "အကောင့်ဖွင့်",
+        "အကောင့်ဖွင့်",
+        "accountဖွင့်",
+        "accountဖွင့်",
+        "accဖွင့်",
+        "register",
+        "signup",
+        "sign up",
+        "ဖွင့်မယ်",
+        "ဖွင့်မယ်",
     ]
-    if any(p in lowered for p in signup_patterns):
+    if any(p.replace(" ", "") in compact for p in signup_patterns):
         return "signup"
 
+    # TrueMoney deposit
     true_deposit_patterns = [
-        "true နဲ့သွင်း", "truemoney နဲ့သွင်း", "true money နဲ့သွင်း",
-        "true number ပို့", "truemoney number ပို့", "true money number ပို့",
-    ]
-    if any(p in lowered for p in true_deposit_patterns):
-        delayed_patterns = [
-            "ကြာပြီ", "မဝင်သေး", "လွှဲထား", "ပို့ထား", "စောင့်နေရ", "မရသေး"
-        ]
-        if not any(d in lowered for d in delayed_patterns):
-            return "truemoney_deposit"
-
-    deposit_patterns = [
-        "ဘဏ်ပို့", "ဘဏ်နံပါတ်ပို့", "ငွေသွင်းမယ်", "ငွေလွှဲမယ်",
-        "bank number", "bank account", "deposit", "transfer"
+        "trueနဲ့သွင်း",
+        "truemoneyနဲ့သွင်း",
+        "truemoneyနဲ့သွင်း",
+        "truemoneynumberပို့",
+        "truemoneynumberပို့",
+        "truenumberပို့",
     ]
     delayed_patterns = [
         "ကြာပြီ", "မဝင်သေး", "လွှဲထား", "ပို့ထား", "စောင့်နေရ", "မရသေး"
     ]
-    if any(p in lowered for p in deposit_patterns) and not any(d in lowered for d in delayed_patterns):
+    if any(p in compact for p in true_deposit_patterns) and not any(d in compact for d in delayed_patterns):
+        return "truemoney_deposit"
+
+    # Bank deposit
+    deposit_patterns = [
+        "ဘဏ်ပို့",
+        "ဘဏ်နံပါတ်ပို့",
+        "ငွေသွင်းမယ်",
+        "ငွေလွှဲမယ်",
+        "banknumber",
+        "bankaccount",
+        "deposit",
+        "transfer",
+    ]
+    if any(p in compact for p in deposit_patterns) and not any(d in compact for d in delayed_patterns):
         return "deposit_bank"
 
+    # MMK site
     mmk_patterns = [
-        "ကျပ်နဲ့", "mmk", "မြန်မာငွေ", "ကျပ် site", "mmk site"
+        "ကျပ်နဲ့", "mmk", "မြန်မာငွေ", "ကျပ်site", "mmksite"
     ]
-    if any(p in lowered for p in mmk_patterns):
+    if any(p in compact for p in mmk_patterns):
         return "mmk_site"
 
+    # Bonus
     bonus_patterns = ["bonus", "ပရိုမိုးရှင်း", "promotion", "promo", "ဘောနပ်"]
-    if any(p in lowered for p in bonus_patterns):
+    if any(p in compact for p in bonus_patterns):
         return "bonus"
 
+    # Line
     line_patterns = ["line", "လိုင်း", "လိုင်းစိမ်း"]
-    if any(p in lowered for p in line_patterns):
+    if any(p in compact for p in line_patterns):
         return "line_link"
 
-    game_link_patterns = ["ဂိမ်းလင့်", "game link", "site link", "ဆိုက်လင့်"]
-    if any(p in lowered for p in game_link_patterns):
+    # Game link
+    game_link_patterns = ["ဂိမ်းလင့်", "gamelink", "sitelink", "ဆိုက်လင့်"]
+    if any(p in compact for p in game_link_patterns):
         return "game_link"
 
-    return ""
+    return ""   
 
 
 def verify_signature(req) -> bool:
