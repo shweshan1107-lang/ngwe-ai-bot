@@ -301,7 +301,7 @@ def handle_user_message(psid: str, text: str) -> None:
 
 @app.route("/", methods=["GET"])
 def home():
-    return "Messenger bot is running", 200
+    return "Messenger bot is running - v2", 200
 
 
 @app.route("/webhook", methods=["GET"])
