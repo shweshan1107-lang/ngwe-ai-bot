@@ -196,6 +196,7 @@ def send_text_message(psid: str, text: str) -> None:
 def handle_user_message(psid: str, text: str) -> None:
     state = get_user_state(psid)
     msg = normalize_text(text)
+    print("USER MESSAGE:", repr(msg))
 
     if not msg:
         return
@@ -210,32 +211,40 @@ def handle_user_message(psid: str, text: str) -> None:
         return
 
     fast_intent = detect_fast_intent(msg)
+    print("FAST INTENT:", fast_intent)
 
     if fast_intent == "deposit_bank":
+        print("REPLY: deposit_bank")
         send_text_message(psid, DEPOSIT_BANK_MESSAGE)
         return
 
     if fast_intent == "truemoney_deposit":
+        print("REPLY: truemoney_deposit")
         send_text_message(psid, TRUEMONEY_DEPOSIT_MESSAGE)
         return
 
     if fast_intent == "mmk_site":
+        print("REPLY: mmk_site")
         send_text_message(psid, MMK_SITE_MESSAGE)
         return
 
     if fast_intent == "bonus":
+        print("REPLY: bonus")
         send_text_message(psid, BONUS_MESSAGE)
         return
 
     if fast_intent == "line_link":
+        print("REPLY: line_link")
         send_text_message(psid, LINE_LINK_MESSAGE)
         return
 
     if fast_intent == "game_link":
+        print("REPLY: game_link")
         send_text_message(psid, GAME_LINK_MESSAGE)
         return
 
     if fast_intent == "true_signup":
+        print("REPLY: true_signup")
         state["signup_data"] = {"bank_type": "TrueMoney"}
         send_text_message(
             psid,
@@ -246,10 +255,11 @@ def handle_user_message(psid: str, text: str) -> None:
         return
 
     if fast_intent == "signup":
+        print("REPLY: signup")
         send_text_message(psid, ACCOUNT_OPENING_REQUEST)
         return
 
-    # unknown => no reply
+    print("REPLY: none")
     return
 
 
