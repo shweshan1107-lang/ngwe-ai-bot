@@ -2,6 +2,7 @@ import hashlib
 import hmac
 import json
 import os
+import time
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -33,6 +34,9 @@ USERS_SHEET_NAME = "users"
 
 client_ai = OpenAI(api_key=OPENAI_API_KEY)
 
+SETTINGS_CACHE = {}
+SETTINGS_CACHE_TS = 0
+SETTINGS_CACHE_TTL = 60
 
 # =========================
 # GOOGLE SHEETS
@@ -90,15 +94,32 @@ def get_or_create_users_sheet():
     return ws
 
 
-def get_setting_value(setting_key: str) -> str:
+def load_settings_cache(force: bool = False):
+    global SETTINGS_CACHE, SETTINGS_CACHE_TS
+
+    now_ts = time.time()
+    if (not force) and SETTINGS_CACHE and (now_ts - SETTINGS_CACHE_TS < SETTINGS_CACHE_TTL):
+        return SETTINGS_CACHE
+
     ws = get_settings_sheet()
     rows = ws.get_all_values()
 
+    data = {}
     for row in rows:
-        if len(row) >= 2 and row[0].strip() == setting_key:
-            return row[1].strip()
+        if len(row) >= 2:
+            key = row[0].strip()
+            value = row[1].strip()
+            if key:
+                data[key] = value
 
-    return ""
+    SETTINGS_CACHE = data
+    SETTINGS_CACHE_TS = now_ts
+    return SETTINGS_CACHE
+
+
+def get_setting_value(setting_key: str) -> str:
+    settings = load_settings_cache()
+    return settings.get(setting_key, "").strip()
 
 
 # =========================
