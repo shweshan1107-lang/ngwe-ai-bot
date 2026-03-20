@@ -337,14 +337,16 @@ Rules:
 14. If asking line link, use "line_link".
 15. If asking MMK site / kyat site, use "mmk_site".
 16. If only greeting like hi, hello, hey, ဟိုင်း, မင်္ဂလာပါ, use "greeting".
-17. If text contains both a greeting and a real request, prioritize the real request.
-18. If not sure, use "other".
-19. Extract these fields only if clearly present:
+17. If the message is only a calling/greeting style message such as "hi", "hello", "ဟိုင်း", "အမ", "ညီမလေး", "အကို", "အစ်ကို", "မ", "ဗျ", "ရှင့်", classify as "greeting".
+18. If the user has previous conversation history, greeting-like messages should still be classified as "greeting", not "other".
+19. If text contains both a greeting and a real request, prioritize the real request.
+20. If not sure, use "other".
+21. Extract these fields only if clearly present:
    - customer_name
    - phone
    - bank_type
    - bank_account
-20. If user is already in account opening flow and sends partial details, still use "account_opening".
+22. If user is already in account opening flow and sends partial details, still use "account_opening".
 
 Previous conversation context:
 {previous_context}
@@ -515,16 +517,20 @@ def handle_user_message(psid: str, text: str, attachments: list | None = None):
         update_user_fields(psid, {"first_seen_at": now_str()})
 
     if intent == "greeting":
-        if is_first_time_user and welcome_message.strip():
-            print("REPLY: welcome_message")
-            send_text_message(psid, welcome_message)
-            return
-        if returning_greeting_message.strip():
-            print("REPLY: returning_greeting_message")
-            send_text_message(psid, returning_greeting_message)
-            return
-        print("REPLY: none")
-        return
+       if is_first_time_user:
+          if welcome_message.strip():
+             print("REPLY: welcome_message")
+             send_text_message(psid, welcome_message)
+          else:
+             print("REPLY: none")
+          return
+
+       if returning_greeting_message.strip():
+          print("REPLY: returning_greeting_message")
+          send_text_message(psid, returning_greeting_message)
+       else:
+          print("REPLY: none")
+       return
 
     if intent == "deposit_bank_info":
         if deposit_bank_message.strip():
