@@ -2,8 +2,8 @@ import hashlib
 import hmac
 import json
 import os
-import threading
 from datetime import datetime, timezone
+from typing import Optional
 
 import gspread
 import requests
@@ -31,14 +31,7 @@ GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON", "")
 SETTINGS_SHEET_NAME = "settings"
 USERS_SHEET_NAME = "users"
 
-# multi-message combine delay (seconds)
-MESSAGE_BUFFER_SECONDS = 12
-
 client_ai = OpenAI(api_key=OPENAI_API_KEY)
-
-# in-memory buffer for short time message combining
-MESSAGE_BUFFER = {}
-BUFFER_LOCK = threading.Lock()
 
 
 # =========================
@@ -67,6 +60,11 @@ def open_spreadsheet():
     return client.open(SPREADSHEET_NAME)
 
 
+def get_settings_sheet():
+    spreadsheet = open_spreadsheet()
+    return spreadsheet.worksheet(SETTINGS_SHEET_NAME)
+
+
 def get_or_create_users_sheet():
     spreadsheet = open_spreadsheet()
 
@@ -84,16 +82,12 @@ def get_or_create_users_sheet():
                 "signup_bank_type",
                 "signup_bank_account",
                 "signup_completed",
+                "last_user_messages",
+                "last_intent",
             ],
             value_input_option="USER_ENTERED",
         )
-
     return ws
-
-
-def get_settings_sheet():
-    spreadsheet = open_spreadsheet()
-    return spreadsheet.worksheet(SETTINGS_SHEET_NAME)
 
 
 def get_setting_value(setting_key: str) -> str:
@@ -108,8 +102,12 @@ def get_setting_value(setting_key: str) -> str:
 
 
 # =========================
-# USER STORAGE IN SHEET
+# USER STORAGE
 # =========================
+def now_str() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
 def get_user_row(psid: str):
     ws = get_or_create_users_sheet()
     rows = ws.get_all_values()
@@ -134,17 +132,16 @@ def ensure_user_exists(psid: str):
     if row_index:
         return ws, row_index, data
 
-    now_val = now_str()
+    now_value = now_str()
     ws.append_row(
-        [psid, now_val, now_val, "", "", "", "", "FALSE"],
+        [psid, now_value, now_value, "", "", "", "", "FALSE", "", ""],
         value_input_option="USER_ENTERED",
     )
     return get_user_row(psid)
 
 
 def update_user_fields(psid: str, updates: dict):
-    ws, row_index, data = ensure_user_exists(psid)
-
+    ws, row_index, _ = ensure_user_exists(psid)
     headers = ws.row_values(1)
     header_map = {name: idx + 1 for idx, name in enumerate(headers)}
 
@@ -155,13 +152,36 @@ def update_user_fields(psid: str, updates: dict):
     return get_user_row(psid)
 
 
+def get_previous_context(user_data: dict) -> str:
+    return (user_data.get("last_user_messages") or "").strip()
+
+
+def update_conversation_context(psid: str, new_message: str, intent: str):
+    _, _, user_data = ensure_user_exists(psid)
+    old_context = (user_data.get("last_user_messages") or "").strip()
+
+    parts = []
+    if old_context:
+        parts.extend([p for p in old_context.split("\n") if p.strip()])
+    if new_message.strip():
+        parts.append(new_message.strip())
+
+    parts = parts[-6:]
+    combined = "\n".join(parts)
+
+    update_user_fields(
+        psid,
+        {
+            "last_user_messages": combined,
+            "last_intent": intent,
+            "last_seen_at": now_str(),
+        },
+    )
+
+
 # =========================
 # HELPERS
 # =========================
-def now_str() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-
-
 def normalize_text(text: str) -> str:
     return " ".join((text or "").strip().split())
 
@@ -206,9 +226,9 @@ def verify_signature(req) -> bool:
 
 
 # =========================
-# MESSENGER SEND API
+# SEND MESSAGE
 # =========================
-def send_text_message(psid: str, text: str) -> None:
+def send_text_message(psid: str, text: str):
     text = (text or "").strip()
     if not text:
         return
@@ -225,7 +245,7 @@ def send_text_message(psid: str, text: str) -> None:
     print("SEND STATUS:", r.status_code, r.text)
 
 
-def send_image_message(psid: str, image_url: str) -> None:
+def send_image_message(psid: str, image_url: str):
     image_url = (image_url or "").strip()
     if not image_url:
         return
@@ -256,12 +276,13 @@ def send_image_message(psid: str, image_url: str) -> None:
 def analyze_message_with_ai(
     user_message: str,
     current_signup_data: dict,
+    previous_context: str = "",
     has_image_attachment: bool = False,
     has_other_attachment: bool = False,
 ):
     system_prompt = f"""
 You are an intent classifier for a Facebook Messenger customer support bot.
-You understand Burmese, English, mixed Burmese-English, slang, short messages, multi-line messages, and messages split across multiple short chat bubbles.
+You understand Burmese, English, mixed Burmese-English, slang, short messages, natural wording, and follow-up messages.
 
 Return ONLY valid JSON.
 
@@ -279,32 +300,33 @@ Supported intents:
 - other
 
 Rules:
-1. You do NOT write the final customer reply.
+1. You do NOT write the final customer support answer.
 2. You only decide the intent and extract account opening fields if present.
-3. Messages may be split into multiple short lines. Read the whole combined text and infer the user's real need.
-4. If user wants to open account / register / signup / create account / sends account info, use "account_opening".
-5. If user is asking for bank account to deposit money, use "deposit_bank_info".
-6. If user is asking whether TrueMoney can be used for deposit or asking for TrueMoney number for deposit, use "truemoney_deposit_info".
-7. If user says they already transferred, already deposited, sends receipt/slip/screenshot, says "ငွေသွင်းပြီးပြီ", "ပြေစာ", "slip", "screenshot", use "deposit_submitted".
-8. If asking bonus/promotion, use "bonus".
-9. If asking loss bonus, use "loss_bonus".
-10. If asking game site link, use "game_link".
-11. If asking line link, use "line_link".
-12. If asking MMK site / kyat site, use "mmk_site".
-13. If only greeting like hi, hello, hey, ဟိုင်း, မင်္ဂလာပါ, use "greeting".
-14. If not sure, use "other".
-15. If there is image attachment and text is empty or looks like deposit proof, prefer "deposit_submitted".
-16. Extract these fields only if clearly present:
+3. The bot must reply immediately based on the current message.
+4. Use previous conversation context to understand short follow-up messages.
+5. If the current message is short like "ဟုတ်", "အင်း", "ပို့", "လင့်", "အကောင့်", infer meaning from recent context.
+6. If user wants to open account / register / signup / create account / sends account opening details, use "account_opening".
+7. If user is asking for bank account to deposit money, use "deposit_bank_info".
+8. If user is asking whether TrueMoney can be used for deposit, or asking for TrueMoney deposit info/number, use "truemoney_deposit_info".
+9. If user says they already transferred, already deposited, sends receipt/slip/screenshot, says "ငွေသွင်းပြီးပြီ", "ပြေစာ", "slip", "screenshot", "ငွေသွင်းဖောင်", "ဖောင်တင်", "ဖောင်တင်ပေး", use "deposit_submitted".
+10. If there is an image attachment and the text looks related to deposit, transfer, receipt, slip, form submission, or proof of payment, classify as "deposit_submitted".
+11. If asking bonus/promotion, use "bonus".
+12. If asking loss bonus, use "loss_bonus".
+13. If asking game site link, game link, site link, use "game_link".
+14. If asking line link, use "line_link".
+15. If asking MMK site / kyat site, use "mmk_site".
+16. If only greeting like hi, hello, hey, ဟိုင်း, မင်္ဂလာပါ, use "greeting".
+17. If text contains both a greeting and a real request, prioritize the real request.
+18. If not sure, use "other".
+19. Extract these fields only if clearly present:
    - customer_name
    - phone
    - bank_type
    - bank_account
-17. If user is already in account opening flow and sends partial details, still use "account_opening".
-18. If text contains both a greeting and a real request, prioritize the real request.
-19. If user sends multiple short lines like:
-    - hi
-    - game link
-   then intent should be "game_link", not just greeting.
+20. If user is already in account opening flow and sends partial details, still use "account_opening".
+
+Previous conversation context:
+{previous_context}
 
 Current collected signup data:
 {json.dumps(current_signup_data, ensure_ascii=False)}
@@ -340,6 +362,15 @@ Return JSON in this exact shape:
 # =========================
 # ACCOUNT OPENING HELPERS
 # =========================
+def get_signup_data_from_user_row(user_data: dict) -> dict:
+    return {
+        "customer_name": (user_data.get("signup_name") or "").strip(),
+        "phone": (user_data.get("signup_phone") or "").strip(),
+        "bank_type": (user_data.get("signup_bank_type") or "").strip(),
+        "bank_account": (user_data.get("signup_bank_account") or "").strip(),
+    }
+
+
 def merge_signup_data(old_data: dict, new_data: dict) -> dict:
     merged = dict(old_data)
 
@@ -364,15 +395,6 @@ def missing_signup_fields(data: dict):
         missing.append("bank_account")
 
     return missing
-
-
-def get_signup_data_from_user_row(user_data: dict) -> dict:
-    return {
-        "customer_name": (user_data.get("signup_name") or "").strip(),
-        "phone": (user_data.get("signup_phone") or "").strip(),
-        "bank_type": (user_data.get("signup_bank_type") or "").strip(),
-        "bank_account": (user_data.get("signup_bank_account") or "").strip(),
-    }
 
 
 def save_signup_data_to_user_row(psid: str, signup_data: dict, completed: bool = False):
@@ -408,48 +430,7 @@ def build_missing_fields_message(base_message: str, missing: list[str]) -> str:
 
 
 # =========================
-# MESSAGE BUFFER / COMBINE
-# =========================
-def add_to_buffer(psid: str, text: str, attachments: list | None = None):
-    attachments = attachments or []
-
-    with BUFFER_LOCK:
-        existing = MESSAGE_BUFFER.get(psid)
-
-        if not existing:
-            timer = threading.Timer(MESSAGE_BUFFER_SECONDS, process_buffered_messages, args=[psid])
-            MESSAGE_BUFFER[psid] = {
-                "texts": [],
-                "attachments": [],
-                "timer": timer,
-            }
-            timer.start()
-
-        if text and text.strip():
-            MESSAGE_BUFFER[psid]["texts"].append(text.strip())
-
-        if attachments:
-            MESSAGE_BUFFER[psid]["attachments"].extend(attachments)
-
-
-def process_buffered_messages(psid: str):
-    with BUFFER_LOCK:
-        payload = MESSAGE_BUFFER.pop(psid, None)
-
-    if not payload:
-        return
-
-    combined_text = "\n".join(payload.get("texts", []))
-    attachments = payload.get("attachments", [])
-
-    print("COMBINED TEXT:", repr(combined_text))
-    print("COMBINED ATTACHMENTS COUNT:", len(attachments))
-
-    handle_user_message(psid, combined_text, attachments)
-
-
-# =========================
-# CORE BOT LOGIC
+# CORE LOGIC
 # =========================
 def handle_user_message(psid: str, text: str, attachments: list | None = None):
     attachments = attachments or []
@@ -465,11 +446,15 @@ def handle_user_message(psid: str, text: str, attachments: list | None = None):
     _, _, user_data = ensure_user_exists(psid)
     current_signup_data = get_signup_data_from_user_row(user_data or {})
     signup_completed = (user_data.get("signup_completed") or "").strip().upper() == "TRUE"
+    previous_context = get_previous_context(user_data or {})
+
+    print("PREVIOUS CONTEXT:", repr(previous_context))
 
     try:
         ai_result = analyze_message_with_ai(
             user_message=msg,
             current_signup_data=current_signup_data,
+            previous_context=previous_context,
             has_image_attachment=has_image_attachment,
             has_other_attachment=has_other_attachment,
         )
@@ -488,7 +473,7 @@ def handle_user_message(psid: str, text: str, attachments: list | None = None):
     }
     print("EXTRACTED FIELDS:", extracted_fields)
 
-    update_user_fields(psid, {"last_seen_at": now_str()})
+    update_conversation_context(psid, msg, intent)
 
     welcome_message = get_setting_value("welcome_message")
     returning_greeting_message = get_setting_value("returning_greeting_message")
@@ -513,12 +498,10 @@ def handle_user_message(psid: str, text: str, attachments: list | None = None):
             print("REPLY: welcome_message")
             send_text_message(psid, welcome_message)
             return
-
         if returning_greeting_message.strip():
             print("REPLY: returning_greeting_message")
             send_text_message(psid, returning_greeting_message)
             return
-
         print("REPLY: none")
         return
 
@@ -626,11 +609,11 @@ def handle_user_message(psid: str, text: str, attachments: list | None = None):
 
 
 # =========================
-# FLASK ROUTES
+# ROUTES
 # =========================
 @app.route("/", methods=["GET"])
 def home():
-    return "Messenger bot is running - AI sheet version", 200
+    return "Messenger bot is running - immediate AI sheet version", 200
 
 
 @app.route("/webhook", methods=["GET"])
@@ -667,8 +650,7 @@ def webhook():
                 if message.get("is_echo"):
                     continue
 
-                # buffer messages for short time to combine multiple quick messages
-                add_to_buffer(psid, text, attachments)
+                handle_user_message(psid, text, attachments)
 
         return "EVENT_RECEIVED", 200
 
