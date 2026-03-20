@@ -2,194 +2,187 @@ import hashlib
 import hmac
 import json
 import os
-import re
-from typing import Optional
+import threading
+from datetime import datetime, timezone
 
+import gspread
 import requests
-from flask import Flask, jsonify, request
+from dotenv import load_dotenv
+from flask import Flask, request
+from google.oauth2.service_account import Credentials
+from openai import OpenAI
+
+load_dotenv()
 
 app = Flask(__name__)
 
+# =========================
+# ENV
+# =========================
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "")
 PAGE_ACCESS_TOKEN = os.getenv("PAGE_ACCESS_TOKEN", "")
 APP_SECRET = os.getenv("APP_SECRET", "")
 
-# ====== YOUR SETTINGS / REPLIES ======
-WELCOME_MESSAGE = "မင်္ဂလာပါရှင့်"
-RETURNING_GREETING_MESSAGE = "ဟုတ်ကဲ့ရှင့်ဘာလေးကူညီပေးရမှာလဲရှင့်"
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+SPREADSHEET_NAME = os.getenv("SPREADSHEET_NAME", "")
+GOOGLE_CREDENTIALS_FILE = os.getenv("GOOGLE_CREDENTIALS_FILE", "")
+GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON", "")
 
-DEPOSIT_BANK_MESSAGE = """ဘဏ်အကောင့် - Mr. Surachai Ladbasri
-ဘဏ်နံပါတ် - 604-279000-7 (SCB)
+SETTINGS_SHEET_NAME = "settings"
+USERS_SHEET_NAME = "users"
 
-ငွေလွှဲပြီးပါက slip လေးပို့ပေးပါရှင့်🤍"""
+# multi-message combine delay (seconds)
+MESSAGE_BUFFER_SECONDS = 12
 
-TRUEMONEY_DEPOSIT_MESSAGE = """ရပါတယ်ရှင့် TrueMoney နဲ့လည်း ငွေသွင်းလို့ရပါတယ်ရှင့်🤍
+client_ai = OpenAI(api_key=OPENAI_API_KEY)
 
-TrueMoney အကောင့် = 098852221
-အမည် = andra"""
-
-ACCOUNT_OPENING_REQUEST = """အကောင့်ဖွင့်ရန် အချက်အလက်အပြည့်အစုံလေး ပို့ပေးပါရှင့်
-
-✅ အမည်
-✅ ဖုန်းနံပါတ်
-✅ Bank အမျိုးအစား
-✅ Bank နံပါတ် (or) True Money"""
-
-TRUEMONEY_SIGNUP_OK_MESSAGE = """ရပါတယ်ရှင့် TrueMoney နဲ့လည်း အကောင့်ဖွင့်လို့ရပါတယ်ရှင့်🤍"""
-
-BONUS_MESSAGE = "Bonus / Promotion အသေးစိတ်ကို ဒီမှာကြည့်ပေးပါရှင့် ..."
-LOSS_BONUS_MESSAGE = "ရှုံးကြေးအကြောင်း အသေးစိတ်ကို ဒီမှာကြည့်ပေးပါရှင့် ..."
-GAME_LINK_MESSAGE = "ဂိမ်းလင့်ပါရှင့်\nhttps://ngwe99.co/home"
-LINE_LINK_MESSAGE = "လိုင်းစိမ်းလင့်ပါရှင့်\nhttps://line.me/R/ti/p/@ngwe"
-MMK_SITE_MESSAGE = "ကျပ်ဆိုက်လင့်ပါရှင့်\nhttps://t.me/ngwe99mmkchannel"
+# in-memory buffer for short time message combining
+MESSAGE_BUFFER = {}
+BUFFER_LOCK = threading.Lock()
 
 
-# ====== SIMPLE IN-MEMORY USER STATE ======
-# Render free restart ရင် reset ဖြစ်နိုင်တယ်
-USER_STATE: dict[str, dict] = {}
+# =========================
+# GOOGLE SHEETS
+# =========================
+def get_gspread_client():
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+
+    if GOOGLE_CREDENTIALS_JSON.strip():
+        creds_info = json.loads(GOOGLE_CREDENTIALS_JSON)
+        creds = Credentials.from_service_account_info(creds_info, scopes=scopes)
+    else:
+        creds = Credentials.from_service_account_file(
+            GOOGLE_CREDENTIALS_FILE,
+            scopes=scopes,
+        )
+
+    return gspread.authorize(creds)
 
 
-def get_user_state(psid: str) -> dict:
-    if psid not in USER_STATE:
-        USER_STATE[psid] = {
-            "seen_welcome": False,
-            "signup_data": {},
-            "signup_completed": False,
-        }
-    return USER_STATE[psid]
+def open_spreadsheet():
+    client = get_gspread_client()
+    return client.open(SPREADSHEET_NAME)
+
+
+def get_or_create_users_sheet():
+    spreadsheet = open_spreadsheet()
+
+    try:
+        ws = spreadsheet.worksheet(USERS_SHEET_NAME)
+    except gspread.WorksheetNotFound:
+        ws = spreadsheet.add_worksheet(title=USERS_SHEET_NAME, rows=2000, cols=20)
+        ws.append_row(
+            [
+                "psid",
+                "first_seen_at",
+                "last_seen_at",
+                "signup_name",
+                "signup_phone",
+                "signup_bank_type",
+                "signup_bank_account",
+                "signup_completed",
+            ],
+            value_input_option="USER_ENTERED",
+        )
+
+    return ws
+
+
+def get_settings_sheet():
+    spreadsheet = open_spreadsheet()
+    return spreadsheet.worksheet(SETTINGS_SHEET_NAME)
+
+
+def get_setting_value(setting_key: str) -> str:
+    ws = get_settings_sheet()
+    rows = ws.get_all_values()
+
+    for row in rows:
+        if len(row) >= 2 and row[0].strip() == setting_key:
+            return row[1].strip()
+
+    return ""
+
+
+# =========================
+# USER STORAGE IN SHEET
+# =========================
+def get_user_row(psid: str):
+    ws = get_or_create_users_sheet()
+    rows = ws.get_all_values()
+
+    if not rows:
+        return ws, None, None
+
+    headers = rows[0]
+    for idx, row in enumerate(rows[1:], start=2):
+        if row and len(row) > 0 and row[0].strip() == psid:
+            data = {}
+            for i, h in enumerate(headers):
+                data[h] = row[i] if i < len(row) else ""
+            return ws, idx, data
+
+    return ws, None, None
+
+
+def ensure_user_exists(psid: str):
+    ws, row_index, data = get_user_row(psid)
+
+    if row_index:
+        return ws, row_index, data
+
+    now_val = now_str()
+    ws.append_row(
+        [psid, now_val, now_val, "", "", "", "", "FALSE"],
+        value_input_option="USER_ENTERED",
+    )
+    return get_user_row(psid)
+
+
+def update_user_fields(psid: str, updates: dict):
+    ws, row_index, data = ensure_user_exists(psid)
+
+    headers = ws.row_values(1)
+    header_map = {name: idx + 1 for idx, name in enumerate(headers)}
+
+    for key, value in updates.items():
+        if key in header_map:
+            ws.update_cell(row_index, header_map[key], value)
+
+    return get_user_row(psid)
+
+
+# =========================
+# HELPERS
+# =========================
+def now_str() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def normalize_text(text: str) -> str:
     return " ".join((text or "").strip().split())
 
 
-def is_greeting_message(text: str) -> bool:
-    lowered = text.lower().strip()
-    normalized = re.sub(r"[^\w\u1000-\u109f]+", "", lowered)
+def safe_json_loads(text: str):
+    text = (text or "").strip()
 
-    greeting_words = [
-        "hi", "hii", "hiii", "hiiii",
-        "hello", "hey", "hy", "helo",
-        "ဟိုင်း", "ဟိုင်းဟိုင်း", "ဟိုင္း", "ဟိုင္းဟိုင္း",
-        "မင်္ဂလာပါ", "မဂ်လာပါ",
-        "ရှိလား",
-    ]
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].startswith("```"):
+            lines = lines[:-1]
+        text = "\n".join(lines)
 
-    normalized_greetings = [
-        re.sub(r"[^\w\u1000-\u109f]+", "", g.lower())
-        for g in greeting_words
-    ]
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1:
+        text = text[start:end + 1]
 
-    if lowered in greeting_words:
-        return True
-    if normalized in normalized_greetings:
-        return True
-    if re.fullmatch(r"h+i+", normalized):
-        return True
-    if re.fullmatch(r"he+y+", normalized):
-        return True
-    if normalized.startswith("ဟိုင်း") or normalized.startswith("ဟိုင္း"):
-        return True
-
-    return False
-
-
-
-def detect_fast_intent(text: str) -> str:
-    lowered = normalize_text(text).lower()
-    compact = lowered.replace(" ", "")
-
-    if is_greeting_message(lowered):
-        return "greeting"
-
-    # TrueMoney signup
-    true_signup_patterns = [
-        "trueနဲ့ဖွင့်",
-        "trueနဲ့အကောင့်ဖွင့်",
-        "truemoneyနဲ့ဖွင့်",
-        "truemoneyနဲ့အကောင့်ဖွင့်",
-        "truemoneyနဲ့accountဖွင့်",
-        "truemoneyနဲ့signup",
-        "truemoneyနဲ့register",
-        "truemoneyဖွင့်",
-        "truemoneyနဲ့ဖွင့်",
-        "truemoney",
-        "truemoney",
-    ]
-    if any(p in compact for p in true_signup_patterns):
-        if "ဖွင့်" in compact or "signup" in compact or "register" in compact or "account" in compact:
-            return "true_signup"
-
-    # Normal signup
-    signup_patterns = [
-        "အကောင့်ဖွင့်",
-        "အကောင့်ဖွင့်",
-        "အကောင့်ဖွင့်",
-        "အကောင့်ဖွင့်",
-        "accountဖွင့်",
-        "accountဖွင့်",
-        "accဖွင့်",
-        "register",
-        "signup",
-        "sign up",
-        "ဖွင့်မယ်",
-        "ဖွင့်မယ်",
-    ]
-    if any(p.replace(" ", "") in compact for p in signup_patterns):
-        return "signup"
-
-    # TrueMoney deposit
-    true_deposit_patterns = [
-        "trueနဲ့သွင်း",
-        "truemoneyနဲ့သွင်း",
-        "truemoneyနဲ့သွင်း",
-        "truemoneynumberပို့",
-        "truemoneynumberပို့",
-        "truenumberပို့",
-    ]
-    delayed_patterns = [
-        "ကြာပြီ", "မဝင်သေး", "လွှဲထား", "ပို့ထား", "စောင့်နေရ", "မရသေး"
-    ]
-    if any(p in compact for p in true_deposit_patterns) and not any(d in compact for d in delayed_patterns):
-        return "truemoney_deposit"
-
-    # Bank deposit
-    deposit_patterns = [
-        "ဘဏ်ပို့",
-        "ဘဏ်နံပါတ်ပို့",
-        "ငွေသွင်းမယ်",
-        "ငွေလွှဲမယ်",
-        "banknumber",
-        "bankaccount",
-        "deposit",
-        "transfer",
-    ]
-    if any(p in compact for p in deposit_patterns) and not any(d in compact for d in delayed_patterns):
-        return "deposit_bank"
-
-    # MMK site
-    mmk_patterns = [
-        "ကျပ်နဲ့", "mmk", "မြန်မာငွေ", "ကျပ်site", "mmksite"
-    ]
-    if any(p in compact for p in mmk_patterns):
-        return "mmk_site"
-
-    # Bonus
-    bonus_patterns = ["bonus", "ပရိုမိုးရှင်း", "promotion", "promo", "ဘောနပ်"]
-    if any(p in compact for p in bonus_patterns):
-        return "bonus"
-
-    # Line
-    line_patterns = ["line", "လိုင်း", "လိုင်းစိမ်း"]
-    if any(p in compact for p in line_patterns):
-        return "line_link"
-
-    # Game link
-    game_link_patterns = ["ဂိမ်းလင့်", "gamelink", "sitelink", "ဆိုက်လင့်"]
-    if any(p in compact for p in game_link_patterns):
-        return "game_link"
-
-    return ""   
+    return json.loads(text)
 
 
 def verify_signature(req) -> bool:
@@ -212,9 +205,12 @@ def verify_signature(req) -> bool:
     return hmac.compare_digest(expected_hash, signature_hash)
 
 
+# =========================
+# MESSENGER SEND API
+# =========================
 def send_text_message(psid: str, text: str) -> None:
-    if not PAGE_ACCESS_TOKEN:
-        print("PAGE_ACCESS_TOKEN missing")
+    text = (text or "").strip()
+    if not text:
         return
 
     url = "https://graph.facebook.com/v23.0/me/messages"
@@ -229,79 +225,412 @@ def send_text_message(psid: str, text: str) -> None:
     print("SEND STATUS:", r.status_code, r.text)
 
 
-def handle_user_message(psid: str, text: str) -> None:
-    state = get_user_state(psid)
-    msg = normalize_text(text)
+def send_image_message(psid: str, image_url: str) -> None:
+    image_url = (image_url or "").strip()
+    if not image_url:
+        return
+
+    url = "https://graph.facebook.com/v23.0/me/messages"
+    params = {"access_token": PAGE_ACCESS_TOKEN}
+    payload = {
+        "recipient": {"id": psid},
+        "messaging_type": "RESPONSE",
+        "message": {
+            "attachment": {
+                "type": "image",
+                "payload": {
+                    "url": image_url,
+                    "is_reusable": True,
+                },
+            }
+        },
+    }
+
+    r = requests.post(url, params=params, json=payload, timeout=30)
+    print("SEND IMAGE STATUS:", r.status_code, r.text)
+
+
+# =========================
+# AI
+# =========================
+def analyze_message_with_ai(
+    user_message: str,
+    current_signup_data: dict,
+    has_image_attachment: bool = False,
+    has_other_attachment: bool = False,
+):
+    system_prompt = f"""
+You are an intent classifier for a Facebook Messenger customer support bot.
+You understand Burmese, English, mixed Burmese-English, slang, short messages, multi-line messages, and messages split across multiple short chat bubbles.
+
+Return ONLY valid JSON.
+
+Supported intents:
+- greeting
+- account_opening
+- deposit_bank_info
+- truemoney_deposit_info
+- deposit_submitted
+- bonus
+- loss_bonus
+- game_link
+- line_link
+- mmk_site
+- other
+
+Rules:
+1. You do NOT write the final customer reply.
+2. You only decide the intent and extract account opening fields if present.
+3. Messages may be split into multiple short lines. Read the whole combined text and infer the user's real need.
+4. If user wants to open account / register / signup / create account / sends account info, use "account_opening".
+5. If user is asking for bank account to deposit money, use "deposit_bank_info".
+6. If user is asking whether TrueMoney can be used for deposit or asking for TrueMoney number for deposit, use "truemoney_deposit_info".
+7. If user says they already transferred, already deposited, sends receipt/slip/screenshot, says "ငွေသွင်းပြီးပြီ", "ပြေစာ", "slip", "screenshot", use "deposit_submitted".
+8. If asking bonus/promotion, use "bonus".
+9. If asking loss bonus, use "loss_bonus".
+10. If asking game site link, use "game_link".
+11. If asking line link, use "line_link".
+12. If asking MMK site / kyat site, use "mmk_site".
+13. If only greeting like hi, hello, hey, ဟိုင်း, မင်္ဂလာပါ, use "greeting".
+14. If not sure, use "other".
+15. If there is image attachment and text is empty or looks like deposit proof, prefer "deposit_submitted".
+16. Extract these fields only if clearly present:
+   - customer_name
+   - phone
+   - bank_type
+   - bank_account
+17. If user is already in account opening flow and sends partial details, still use "account_opening".
+18. If text contains both a greeting and a real request, prioritize the real request.
+19. If user sends multiple short lines like:
+    - hi
+    - game link
+   then intent should be "game_link", not just greeting.
+
+Current collected signup data:
+{json.dumps(current_signup_data, ensure_ascii=False)}
+
+Attachment hints:
+- has_image_attachment = {has_image_attachment}
+- has_other_attachment = {has_other_attachment}
+
+Return JSON in this exact shape:
+{{
+  "intent": "greeting|account_opening|deposit_bank_info|truemoney_deposit_info|deposit_submitted|bonus|loss_bonus|game_link|line_link|mmk_site|other",
+  "customer_name": "",
+  "phone": "",
+  "bank_type": "",
+  "bank_account": ""
+}}
+"""
+
+    user_input = user_message.strip() if user_message.strip() else "[empty text]"
+
+    response = client_ai.responses.create(
+        model="gpt-5-mini",
+        input=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_input},
+        ],
+    )
+
+    raw = response.output_text.strip()
+    return safe_json_loads(raw)
+
+
+# =========================
+# ACCOUNT OPENING HELPERS
+# =========================
+def merge_signup_data(old_data: dict, new_data: dict) -> dict:
+    merged = dict(old_data)
+
+    for key in ["customer_name", "phone", "bank_type", "bank_account"]:
+        value = (new_data.get(key) or "").strip()
+        if value:
+            merged[key] = value
+
+    return merged
+
+
+def missing_signup_fields(data: dict):
+    missing = []
+
+    if not data.get("customer_name"):
+        missing.append("customer_name")
+    if not data.get("phone"):
+        missing.append("phone")
+    if not data.get("bank_type"):
+        missing.append("bank_type")
+    if not data.get("bank_account"):
+        missing.append("bank_account")
+
+    return missing
+
+
+def get_signup_data_from_user_row(user_data: dict) -> dict:
+    return {
+        "customer_name": (user_data.get("signup_name") or "").strip(),
+        "phone": (user_data.get("signup_phone") or "").strip(),
+        "bank_type": (user_data.get("signup_bank_type") or "").strip(),
+        "bank_account": (user_data.get("signup_bank_account") or "").strip(),
+    }
+
+
+def save_signup_data_to_user_row(psid: str, signup_data: dict, completed: bool = False):
+    update_user_fields(
+        psid,
+        {
+            "signup_name": signup_data.get("customer_name", ""),
+            "signup_phone": signup_data.get("phone", ""),
+            "signup_bank_type": signup_data.get("bank_type", ""),
+            "signup_bank_account": signup_data.get("bank_account", ""),
+            "signup_completed": "TRUE" if completed else "FALSE",
+            "last_seen_at": now_str(),
+        },
+    )
+
+
+def build_missing_fields_message(base_message: str, missing: list[str]) -> str:
+    field_map = {
+        "customer_name": "✅အမည်",
+        "phone": "✅ဖုန်းနံပါတ်",
+        "bank_type": "✅Bank အမျိုးအစား",
+        "bank_account": "✅Bank နံပါတ် (or) True Money",
+    }
+
+    if len(missing) == 4:
+        return base_message.strip()
+
+    lines = [field_map[m] for m in missing if m in field_map]
+    if not lines:
+        return base_message.strip()
+
+    return base_message.strip() + "\n\n" + "\n".join(lines)
+
+
+# =========================
+# MESSAGE BUFFER / COMBINE
+# =========================
+def add_to_buffer(psid: str, text: str, attachments: list | None = None):
+    attachments = attachments or []
+
+    with BUFFER_LOCK:
+        existing = MESSAGE_BUFFER.get(psid)
+
+        if not existing:
+            timer = threading.Timer(MESSAGE_BUFFER_SECONDS, process_buffered_messages, args=[psid])
+            MESSAGE_BUFFER[psid] = {
+                "texts": [],
+                "attachments": [],
+                "timer": timer,
+            }
+            timer.start()
+
+        if text and text.strip():
+            MESSAGE_BUFFER[psid]["texts"].append(text.strip())
+
+        if attachments:
+            MESSAGE_BUFFER[psid]["attachments"].extend(attachments)
+
+
+def process_buffered_messages(psid: str):
+    with BUFFER_LOCK:
+        payload = MESSAGE_BUFFER.pop(psid, None)
+
+    if not payload:
+        return
+
+    combined_text = "\n".join(payload.get("texts", []))
+    attachments = payload.get("attachments", [])
+
+    print("COMBINED TEXT:", repr(combined_text))
+    print("COMBINED ATTACHMENTS COUNT:", len(attachments))
+
+    handle_user_message(psid, combined_text, attachments)
+
+
+# =========================
+# CORE BOT LOGIC
+# =========================
+def handle_user_message(psid: str, text: str, attachments: list | None = None):
+    attachments = attachments or []
+    msg = normalize_text(text or "")
+
+    has_image_attachment = any(a.get("type") == "image" for a in attachments)
+    has_other_attachment = any(a.get("type") != "image" for a in attachments)
+
     print("USER MESSAGE:", repr(msg))
+    print("HAS IMAGE ATTACHMENT:", has_image_attachment)
+    print("HAS OTHER ATTACHMENT:", has_other_attachment)
 
-    if not msg:
-        return
+    _, _, user_data = ensure_user_exists(psid)
+    current_signup_data = get_signup_data_from_user_row(user_data or {})
+    signup_completed = (user_data.get("signup_completed") or "").strip().upper() == "TRUE"
 
-    if not state["seen_welcome"]:
-        state["seen_welcome"] = True
-        send_text_message(psid, WELCOME_MESSAGE)
-        return
-
-    if is_greeting_message(msg):
-        send_text_message(psid, RETURNING_GREETING_MESSAGE)
-        return
-
-    fast_intent = detect_fast_intent(msg)
-    print("FAST INTENT:", fast_intent)
-
-    if fast_intent == "deposit_bank":
-        print("REPLY: deposit_bank")
-        send_text_message(psid, DEPOSIT_BANK_MESSAGE)
-        return
-
-    if fast_intent == "truemoney_deposit":
-        print("REPLY: truemoney_deposit")
-        send_text_message(psid, TRUEMONEY_DEPOSIT_MESSAGE)
-        return
-
-    if fast_intent == "mmk_site":
-        print("REPLY: mmk_site")
-        send_text_message(psid, MMK_SITE_MESSAGE)
-        return
-
-    if fast_intent == "bonus":
-        print("REPLY: bonus")
-        send_text_message(psid, BONUS_MESSAGE)
-        return
-
-    if fast_intent == "line_link":
-        print("REPLY: line_link")
-        send_text_message(psid, LINE_LINK_MESSAGE)
-        return
-
-    if fast_intent == "game_link":
-        print("REPLY: game_link")
-        send_text_message(psid, GAME_LINK_MESSAGE)
-        return
-
-    if fast_intent == "true_signup":
-        print("REPLY: true_signup")
-        state["signup_data"] = {"bank_type": "TrueMoney"}
-        send_text_message(
-            psid,
-            TRUEMONEY_SIGNUP_OK_MESSAGE + "\n\n" +
-            "အကောင့်ဖွင့်ရန် လိုအပ်တဲ့အချက်အလက်လေး ပို့ပေးပါရှင့်\n\n"
-            "✅အမည်\n✅ဖုန်းနံပါတ်\n✅TrueMoney နံပါတ်"
+    try:
+        ai_result = analyze_message_with_ai(
+            user_message=msg,
+            current_signup_data=current_signup_data,
+            has_image_attachment=has_image_attachment,
+            has_other_attachment=has_other_attachment,
         )
+    except Exception as e:
+        print("AI ERROR:", e)
         return
 
-    if fast_intent == "signup":
-        print("REPLY: signup")
-        send_text_message(psid, ACCOUNT_OPENING_REQUEST)
+    intent = (ai_result.get("intent") or "other").strip()
+    print("AI INTENT:", intent)
+
+    extracted_fields = {
+        "customer_name": (ai_result.get("customer_name") or "").strip(),
+        "phone": (ai_result.get("phone") or "").strip(),
+        "bank_type": (ai_result.get("bank_type") or "").strip(),
+        "bank_account": (ai_result.get("bank_account") or "").strip(),
+    }
+    print("EXTRACTED FIELDS:", extracted_fields)
+
+    update_user_fields(psid, {"last_seen_at": now_str()})
+
+    welcome_message = get_setting_value("welcome_message")
+    returning_greeting_message = get_setting_value("returning_greeting_message")
+    account_opening_request = get_setting_value("account_opening_request")
+    deposit_bank_message = get_setting_value("deposit_bank_message")
+    truemoney_deposit_message = get_setting_value("truemoney_deposit_message")
+    truemoney_signup_ok_message = get_setting_value("truemoney_signup_ok_message")
+    deposit_submitted_message = get_setting_value("deposit_submitted_message")
+    deposit_submitted_image_url = get_setting_value("deposit_submitted_image_url")
+    bonus_message = get_setting_value("bonus_message")
+    loss_bonus_message = get_setting_value("loss_bonus_message")
+    game_link_message = get_setting_value("game_link_message")
+    line_link_message = get_setting_value("line_link_message")
+    mmk_site_message = get_setting_value("mmk_site_message")
+
+    is_first_time_user = not (user_data.get("first_seen_at") or "").strip()
+    if is_first_time_user:
+        update_user_fields(psid, {"first_seen_at": now_str()})
+
+    if intent == "greeting":
+        if is_first_time_user and welcome_message.strip():
+            print("REPLY: welcome_message")
+            send_text_message(psid, welcome_message)
+            return
+
+        if returning_greeting_message.strip():
+            print("REPLY: returning_greeting_message")
+            send_text_message(psid, returning_greeting_message)
+            return
+
+        print("REPLY: none")
+        return
+
+    if intent == "deposit_bank_info":
+        if deposit_bank_message.strip():
+            print("REPLY: deposit_bank_message")
+            send_text_message(psid, deposit_bank_message)
+        else:
+            print("REPLY: none")
+        return
+
+    if intent == "truemoney_deposit_info":
+        if truemoney_deposit_message.strip():
+            print("REPLY: truemoney_deposit_message")
+            send_text_message(psid, truemoney_deposit_message)
+        else:
+            print("REPLY: none")
+        return
+
+    if intent == "deposit_submitted":
+        replied = False
+
+        if deposit_submitted_message.strip():
+            print("REPLY: deposit_submitted_message")
+            send_text_message(psid, deposit_submitted_message)
+            replied = True
+
+        if deposit_submitted_image_url.strip():
+            print("REPLY: deposit_submitted_image_url")
+            send_image_message(psid, deposit_submitted_image_url)
+            replied = True
+
+        if not replied:
+            print("REPLY: none")
+        return
+
+    if intent == "bonus":
+        if bonus_message.strip():
+            print("REPLY: bonus_message")
+            send_text_message(psid, bonus_message)
+        else:
+            print("REPLY: none")
+        return
+
+    if intent == "loss_bonus":
+        if loss_bonus_message.strip():
+            print("REPLY: loss_bonus_message")
+            send_text_message(psid, loss_bonus_message)
+        else:
+            print("REPLY: none")
+        return
+
+    if intent == "game_link":
+        if game_link_message.strip():
+            print("REPLY: game_link_message")
+            send_text_message(psid, game_link_message)
+        else:
+            print("REPLY: none")
+        return
+
+    if intent == "line_link":
+        if line_link_message.strip():
+            print("REPLY: line_link_message")
+            send_text_message(psid, line_link_message)
+        else:
+            print("REPLY: none")
+        return
+
+    if intent == "mmk_site":
+        if mmk_site_message.strip():
+            print("REPLY: mmk_site_message")
+            send_text_message(psid, mmk_site_message)
+        else:
+            print("REPLY: none")
+        return
+
+    if intent == "account_opening" or (not signup_completed and any(extracted_fields.values())):
+        merged_signup_data = merge_signup_data(current_signup_data, extracted_fields)
+        missing = missing_signup_fields(merged_signup_data)
+
+        print("MERGED SIGNUP DATA:", merged_signup_data)
+        print("MISSING FIELDS:", missing)
+
+        save_signup_data_to_user_row(psid, merged_signup_data, completed=(len(missing) == 0))
+
+        if missing:
+            bank_type = (merged_signup_data.get("bank_type") or "").lower()
+            if bank_type == "truemoney" and truemoney_signup_ok_message.strip():
+                print("REPLY: truemoney_signup_ok_message")
+                send_text_message(psid, truemoney_signup_ok_message)
+
+            if account_opening_request.strip():
+                final_text = build_missing_fields_message(account_opening_request, missing)
+                print("REPLY: account_opening_request")
+                send_text_message(psid, final_text)
+            else:
+                print("REPLY: none")
+            return
+
+        print("REPLY: none (signup complete, admin will continue)")
         return
 
     print("REPLY: none")
     return
 
 
+# =========================
+# FLASK ROUTES
+# =========================
 @app.route("/", methods=["GET"])
 def home():
-    return "Messenger bot is running - v2", 200
+    return "Messenger bot is running - AI sheet version", 200
 
 
 @app.route("/webhook", methods=["GET"])
@@ -328,15 +657,18 @@ def webhook():
             for messaging_event in entry.get("messaging", []):
                 sender = messaging_event.get("sender", {})
                 psid = sender.get("id")
-
                 if not psid:
                     continue
 
-                message = messaging_event.get("message", {})
-                text = message.get("text")
+                message = messaging_event.get("message", {}) or {}
+                text = message.get("text", "") or ""
+                attachments = message.get("attachments", []) or []
 
-                if text:
-                    handle_user_message(psid, text)
+                if message.get("is_echo"):
+                    continue
+
+                # buffer messages for short time to combine multiple quick messages
+                add_to_buffer(psid, text, attachments)
 
         return "EVENT_RECEIVED", 200
 
