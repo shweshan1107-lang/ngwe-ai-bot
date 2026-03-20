@@ -512,26 +512,25 @@ def handle_user_message(psid: str, text: str, attachments: list | None = None):
     line_link_message = get_setting_value("line_link_message")
     mmk_site_message = get_setting_value("mmk_site_message")
 
-    is_first_time_user = not (user_data.get("first_seen_at") or "").strip()
-    if is_first_time_user:
-        update_user_fields(psid, {"first_seen_at": now_str()})
+    previous_context_exists = bool((previous_context or "").strip())
 
     if intent == "greeting":
-       if is_first_time_user:
-          if welcome_message.strip():
-             print("REPLY: welcome_message")
-             send_text_message(psid, welcome_message)
-          else:
-             print("REPLY: none")
-          return
+        if not previous_context_exists:
+            if welcome_message.strip():
+                print("REPLY: welcome_message")
+                send_text_message(psid, welcome_message)
+            else:
+                print("REPLY: none")
+            update_user_fields(psid, {"first_seen_at": now_str(), "last_seen_at": now_str()})
+            return
 
-       if returning_greeting_message.strip():
-          print("REPLY: returning_greeting_message")
-          send_text_message(psid, returning_greeting_message)
-       else:
-          print("REPLY: none")
-       return
-
+        if returning_greeting_message.strip():
+            print("REPLY: returning_greeting_message")
+            send_text_message(psid, returning_greeting_message)
+        else:
+            print("REPLY: none")
+        return
+    
     if intent == "deposit_bank_info":
         if deposit_bank_message.strip():
             print("REPLY: deposit_bank_message")
