@@ -6,6 +6,7 @@ import time
 from datetime import datetime, timezone
 from typing import Optional
 
+
 import gspread
 import requests
 from dotenv import load_dotenv
@@ -37,6 +38,10 @@ client_ai = OpenAI(api_key=OPENAI_API_KEY)
 SETTINGS_CACHE = {}
 SETTINGS_CACHE_TS = 0
 SETTINGS_CACHE_TTL = 60
+
+PROCESSED_MIDS: dict[str, float] = {}
+PROCESSED_MIDS_TTL = 180
+
 
 # =========================
 # GOOGLE SHEETS
@@ -244,6 +249,23 @@ def verify_signature(req) -> bool:
     mac = hmac.new(APP_SECRET.encode("utf-8"), msg=req.data, digestmod=hashlib.sha256)
     expected_hash = mac.hexdigest()
     return hmac.compare_digest(expected_hash, signature_hash)
+
+
+def is_duplicate_mid(mid: str) -> bool:
+    if not mid:
+        return False
+
+    now_ts = time.time()
+
+    expired = [saved_mid for saved_mid, saved_ts in PROCESSED_MIDS.items() if now_ts - saved_ts > PROCESSED_MIDS_TTL]
+    for saved_mid in expired:
+        PROCESSED_MIDS.pop(saved_mid, None)
+
+    if mid in PROCESSED_MIDS:
+        return True
+
+    PROCESSED_MIDS[mid] = now_ts
+    return False
 
 
 # =========================
@@ -459,6 +481,10 @@ def handle_user_message(psid: str, text: str, attachments: list | None = None):
     attachments = attachments or []
     msg = normalize_text(text or "")
 
+    if not msg and not attachments:
+        print("SKIP: empty text and no attachments")
+        return
+
     has_image_attachment = any(a.get("type") == "image" for a in attachments)
     has_other_attachment = any(a.get("type") != "image" for a in attachments)
 
@@ -511,6 +537,7 @@ def handle_user_message(psid: str, text: str, attachments: list | None = None):
     game_link_message = get_setting_value("game_link_message")
     line_link_message = get_setting_value("line_link_message")
     mmk_site_message = get_setting_value("mmk_site_message")
+    fallback_other_message = get_setting_value("fallback_other_message") or get_setting_value("other_message")
 
     previous_context_exists = bool((previous_context or "").strip())
 
@@ -630,7 +657,12 @@ def handle_user_message(psid: str, text: str, attachments: list | None = None):
         print("REPLY: none (signup complete, admin will continue)")
         return
 
-    print("REPLY: none")
+    if fallback_other_message.strip():
+        print("REPLY: fallback_other_message")
+        send_text_message(psid, fallback_other_message)
+    else:
+        print("REPLY: default_fallback_message")
+        send_text_message(psid, "ဟုတ်ကဲ့ရှင့်အကို၊ ဘာကိုကူညီပေးရမလဲရှင့်။\nအကောင့်ဖွင့်ချင်တာလား၊ ငွေသွင်းနည်းမေးတာလား၊ promo မေးတာလားရှင့်။")
     return
 
 
@@ -667,13 +699,44 @@ def webhook():
                 sender = messaging_event.get("sender", {})
                 psid = sender.get("id")
                 if not psid:
+                    print("SKIP: missing sender psid")
                     continue
 
-                message = messaging_event.get("message", {}) or {}
+                if messaging_event.get("delivery"):
+                    print("SKIP: delivery event")
+                    continue
+
+                if messaging_event.get("read"):
+                    print("SKIP: read event")
+                    continue
+
+                if messaging_event.get("reaction"):
+                    print("SKIP: reaction event")
+                    continue
+
+                if messaging_event.get("postback"):
+                    print("SKIP: postback event (not handled yet)")
+                    continue
+
+                message = messaging_event.get("message") or {}
+                if not message:
+                    print("SKIP: no message payload")
+                    continue
+
+                if message.get("is_echo"):
+                    print("SKIP: echo message")
+                    continue
+
+                mid = (message.get("mid") or "").strip()
+                if is_duplicate_mid(mid):
+                    print("SKIP: duplicate mid", mid)
+                    continue
+
                 text = message.get("text", "") or ""
                 attachments = message.get("attachments", []) or []
 
-                if message.get("is_echo"):
+                if not text and not attachments:
+                    print("SKIP: message without text or attachments")
                     continue
 
                 handle_user_message(psid, text, attachments)
